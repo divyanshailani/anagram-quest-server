@@ -8,13 +8,17 @@ FastAPI backend with:
   - SSE streaming: Real-time "AI Thinking" events for the frontend
 """
 
-import uuid
-import random
+from __future__ import annotations
+
 import asyncio
+import random
 import time
-from typing import AsyncGenerator
+import uuid
+from collections.abc import AsyncGenerator
+from typing import Any
 
 import httpx
+import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -161,7 +165,7 @@ ANAGRAM_GROUPS = {
 }
 
 
-def get_level_groups(level: int) -> dict:
+def get_level_groups(level: int) -> dict[str, list[str]]:
     """Get anagram groups for a specific level."""
     target = level + 2
     if level == 5:
@@ -178,13 +182,13 @@ class BankingEngine:
 
     ACCURACY = {3: 0.98, 4: 0.95, 5: 0.92, 6: 0.88, 7: 0.85}
 
-    def __init__(self):
-        self.decisions_log = []
+    def __init__(self) -> None:
+        self.decisions_log: list[dict[str, Any]] = []
 
     def decide_bank_choice(
         self, level: int, guesses_left: int, words_remaining: int,
-        banked: int
-    ) -> tuple[str, dict]:
+        _banked: int
+    ) -> tuple[str, dict[str, Any]]:
         """Earn decision: 'preserve' or 'current'."""
         if guesses_left <= 1 and words_remaining > 1:
             ev_current = words_remaining * 0.5
@@ -208,8 +212,8 @@ class BankingEngine:
         return decision, info
 
     def decide_recovery(
-        self, banked: int, failed_words: list, levels_remaining: int
-    ) -> tuple[bool, dict | None]:
+        self, banked: int, failed_words: list[dict[str, Any]], levels_remaining: int
+    ) -> tuple[bool, dict[str, Any] | None]:
         """Spend decision: attempt recovery?"""
         if banked <= 0 or not failed_words:
             return False, None
@@ -240,14 +244,14 @@ class BankingEngine:
 class GameState:
     """Holds state for one game session."""
 
-    def __init__(self):
-        self.level = 1
-        self.total_reward = 0.0
-        self.banked_chances = 0
-        self.failed_words = []
-        self.level_results = []
+    def __init__(self) -> None:
+        self.level: int = 1
+        self.total_reward: float = 0.0
+        self.banked_chances: int = 0
+        self.failed_words: list[dict[str, Any]] = []
+        self.level_results: list[dict[str, Any]] = []
         self.banker = BankingEngine()
-        self.status = "created"  # created → playing → finished
+        self.status: str = "created"  # created → playing → finished
 
 
 # In-memory session store (UUID → GameState)
@@ -265,7 +269,7 @@ async def ai_play_stream(game: GameState) -> AsyncGenerator[str, None]:
     """
     import json
 
-    def sse(event_type: str, data: dict) -> str:
+    def sse(event_type: str, data: dict[str, Any]) -> str:
         return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
     game.status = "playing"
@@ -507,7 +511,7 @@ app.add_middleware(
 
 # ── Health / Info ──
 @app.get("/")
-async def root():
+async def root() -> dict[str, Any]:
     return {
         "service": "Anagram Quest Game Master",
         "oracle": ORACLE_URL,
@@ -522,7 +526,7 @@ async def root():
 
 
 @app.get("/health")
-async def health():
+async def health() -> dict[str, Any]:
     """Health check — also pings the Oracle."""
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -541,7 +545,7 @@ async def health():
 
 # ── SSE Stream: Watch AI Play ──
 @app.get("/stream-ai-play")
-async def stream_ai_play():
+async def stream_ai_play() -> StreamingResponse:
     """
     Start a new game and stream all events via SSE.
 
@@ -554,7 +558,7 @@ async def stream_ai_play():
     game = GameState()
     active_games[game_id] = game
 
-    async def stream():
+    async def stream() -> AsyncGenerator[str, None]:
         try:
             async for event in ai_play_stream(game):
                 yield event
@@ -576,7 +580,7 @@ async def stream_ai_play():
 
 # ── Game Status (for polling / debug) ──
 @app.get("/game/{game_id}")
-async def get_game(game_id: str):
+async def get_game(game_id: str) -> dict[str, Any]:
     game = active_games.get(game_id)
     if not game:
         raise HTTPException(404, "Game not found")
@@ -598,19 +602,22 @@ async def get_game(game_id: str):
 class MatchState:
     """State for a Player vs AI match."""
 
-    def __init__(self):
-        self.match_id = str(uuid.uuid4())[:8]
-        self.status = "waiting"  # waiting → playing → finished
-        self.current_level = 0
-        self.levels_data = []    # pre-generated: [{sorted_key, letters, valid_words}, ...]
-        self.human_score = 0.0
-        self.human_found = {}    # level -> [words]
-        self.human_guesses = {}  # level -> count
-        self.ai_score = 0.0
-        self.ai_found = {}      # level -> [words]
-        self.level_results = []
-        self.created_at = time.time()
-        self.last_active = time.time()
+    def __init__(self) -> None:
+        self.match_id: str = str(uuid.uuid4())[:8]
+        self.status: str = "waiting"  # waiting → playing → finished
+        self.current_level: int = 0
+        self.levels_data: list[dict[str, Any]] = []
+        self.human_score: float = 0.0
+        self.human_found: dict[int, list[str]] = {}
+        self.human_guesses: dict[int, int] = {}
+        self.ai_score: float = 0.0
+        self.ai_found: dict[int, list[str]] = {}
+        self.ai_guesses: dict[int, list[str]] = {}
+        self.ai_guess_cursor: dict[int, int] = {}
+        self.ai_completion_awarded: set[int] = set()
+        self.level_results: list[dict[str, Any]] = []
+        self.created_at: float = time.time()
+        self.last_active: float = time.time()
 
         # Pre-generate 5 levels of letters
         for level in range(1, 6):
@@ -628,7 +635,7 @@ class MatchState:
                 "valid_words": valid_words,
             })
 
-    def touch(self):
+    def touch(self) -> None:
         self.last_active = time.time()
 
 
@@ -641,9 +648,12 @@ class GuessRequest(BaseModel):
 
 
 @app.post("/match/create")
-async def create_match():
+async def create_match() -> dict[str, Any]:
     """Create a new Player vs AI match."""
     match = MatchState()
+    if not match.levels_data:
+        raise HTTPException(500, "No level data configured")
+
     match.current_level = 1
     match.status = "playing"
     active_matches[match.match_id] = match
@@ -663,7 +673,7 @@ async def create_match():
 
 
 @app.post("/match/{match_id}/guess")
-async def match_guess(match_id: str, req: GuessRequest):
+async def match_guess(match_id: str, req: GuessRequest) -> dict[str, Any]:
     """Validate a human player's guess."""
     match = active_matches.get(match_id)
     if not match:
@@ -673,6 +683,9 @@ async def match_guess(match_id: str, req: GuessRequest):
 
     match.touch()
     level = match.current_level
+    if level < 1 or level > len(match.levels_data):
+        raise HTTPException(400, "Invalid match level")
+
     level_data = match.levels_data[level - 1]
     word = req.word.upper().strip()
 
@@ -713,7 +726,7 @@ async def match_guess(match_id: str, req: GuessRequest):
 
 
 @app.post("/match/{match_id}/next-level")
-async def match_next_level(match_id: str):
+async def match_next_level(match_id: str) -> dict[str, Any]:
     """Advance to the next level."""
     match = active_matches.get(match_id)
     if not match:
@@ -721,6 +734,8 @@ async def match_next_level(match_id: str):
 
     match.touch()
     current = match.current_level
+    if current < 1 or current > len(match.levels_data):
+        raise HTTPException(400, "Invalid match level")
 
     # Record level result
     level_data = match.levels_data[current - 1]
@@ -768,7 +783,7 @@ async def match_next_level(match_id: str):
 
 
 @app.get("/match/{match_id}/ai-stream")
-async def match_ai_stream(match_id: str):
+async def match_ai_stream(match_id: str) -> StreamingResponse:
     """
     SSE stream for the AI side of a Player vs AI match.
     AI solves instantly via Oracle but drip-feeds results every 4-5 seconds.
@@ -779,10 +794,10 @@ async def match_ai_stream(match_id: str):
 
     import json
 
-    def sse(event_type: str, data: dict) -> str:
+    def sse(event_type: str, data: dict[str, Any]) -> str:
         return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
-    async def stream():
+    async def stream() -> AsyncGenerator[str, None]:
         match.touch()
         level = match.current_level
         level_data = match.levels_data[level - 1]
@@ -800,12 +815,16 @@ async def match_ai_stream(match_id: str):
             "phase": "solve",
         })
 
-        # Call Oracle instantly
-        try:
-            ai_guesses = await call_oracle(letters)
-        except Exception as e:
-            yield sse("ai_error", {"message": str(e)})
-            return
+        # Cache oracle candidates by level so reconnects resume deterministically.
+        if level not in match.ai_guesses:
+            try:
+                match.ai_guesses[level] = await call_oracle(letters)
+                match.ai_guess_cursor[level] = 0
+            except Exception as exc:
+                yield sse("ai_error", {"message": str(exc)})
+                return
+
+        ai_guesses = match.ai_guesses[level]
 
         yield sse("ai_thinking", {
             "text": f"[LLM Solver] Found {len(ai_guesses)} candidates",
@@ -813,20 +832,25 @@ async def match_ai_stream(match_id: str):
         })
         await asyncio.sleep(1.5)
 
-        # Drip-feed scored results
-        found = []
-        for i, word in enumerate(ai_guesses):
+        if level not in match.ai_found:
+            match.ai_found[level] = []
+
+        # Drip-feed scored results; resume from previous cursor on SSE reconnect.
+        start_idx = match.ai_guess_cursor.get(level, 0)
+        for idx in range(start_idx, len(ai_guesses)):
             if match.status != "playing":
                 break
 
-            if word in valid_words and word not in found:
-                found.append(word)
-                is_first = len(found) == 1 and i == 0
+            word = ai_guesses[idx]
+            match.ai_guess_cursor[level] = idx + 1
+
+            if word in match.ai_found[level]:
+                continue
+
+            if word in valid_words:
+                is_first = len(match.ai_found[level]) == 0
                 reward = 1.0 if is_first else 0.5
                 match.ai_score += reward
-
-                if level not in match.ai_found:
-                    match.ai_found[level] = []
                 match.ai_found[level].append(word)
 
                 yield sse("ai_guess", {
@@ -835,7 +859,7 @@ async def match_ai_stream(match_id: str):
                     "first_try": is_first,
                     "reward": reward,
                     "ai_score": round(match.ai_score, 1),
-                    "found_count": len(found),
+                    "found_count": len(match.ai_found[level]),
                 })
             else:
                 yield sse("ai_guess", {
@@ -844,17 +868,18 @@ async def match_ai_stream(match_id: str):
                     "reward": 0,
                 })
 
-            # Drip-feed: 4-5 seconds between guesses
-            await asyncio.sleep(random.uniform(3.5, 5.5))
+            # Drip-feed: 3-5 seconds between guesses
+            await asyncio.sleep(random.uniform(3.0, 5.0))
 
-        # Completion bonus
-        all_found = len(found) == len(valid_words)
-        if all_found:
+        found_words = match.ai_found[level]
+        all_found = len(found_words) == len(valid_words)
+        if all_found and level not in match.ai_completion_awarded:
             match.ai_score += 2.0
+            match.ai_completion_awarded.add(level)
 
         yield sse("ai_level_done", {
             "level": level,
-            "found": found,
+            "found": found_words,
             "total": len(valid_words),
             "all_found": all_found,
             "ai_score": round(match.ai_score, 1),
@@ -870,7 +895,7 @@ async def match_ai_stream(match_id: str):
 
 
 @app.get("/match/{match_id}/status")
-async def match_status(match_id: str):
+async def match_status(match_id: str) -> dict[str, Any]:
     """Get current match state."""
     match = active_matches.get(match_id)
     if not match:
@@ -887,8 +912,8 @@ async def match_status(match_id: str):
 
 # ── Garbage Collection ──
 @app.on_event("startup")
-async def start_gc():
-    async def gc_loop():
+async def start_gc() -> None:
+    async def gc_loop() -> None:
         while True:
             await asyncio.sleep(60)
             cutoff = time.time() - 300  # 5 minutes
@@ -902,5 +927,4 @@ async def start_gc():
 # Entrypoint
 # ══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
