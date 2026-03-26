@@ -9,7 +9,7 @@ export DEBIAN_FRONTEND=noninteractive
 
 echo "═══ 1. System Update ═══"
 apt update && apt upgrade -y -o Dpkg::Options::="--force-confold"
-apt install -y python3.11 python3.11-venv python3-pip nginx certbot python3-certbot-nginx git ufw
+apt install -y python3 python3-venv python3-pip nginx certbot python3-certbot-nginx git ufw
 
 echo "═══ 2. Firewall ═══"
 ufw allow OpenSSH
@@ -22,7 +22,7 @@ cd /opt/anagram-quest
 git clone https://github.com/divyanshailani/anagram-quest-server.git .
 
 echo "═══ 4. Python Virtual Environment ═══"
-python3.11 -m venv venv
+python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
