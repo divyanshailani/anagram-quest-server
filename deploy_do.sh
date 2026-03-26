@@ -5,9 +5,10 @@
 # ══════════════════════════════════════════════════════════════
 
 set -e
+export DEBIAN_FRONTEND=noninteractive
 
 echo "═══ 1. System Update ═══"
-apt update && apt upgrade -y
+apt update && apt upgrade -y -o Dpkg::Options::="--force-confold"
 apt install -y python3.11 python3.11-venv python3-pip nginx certbot python3-certbot-nginx git ufw
 
 echo "═══ 2. Firewall ═══"
