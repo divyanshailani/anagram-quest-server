@@ -31,17 +31,81 @@ ORACLE_URL = "https://ailanidivyansh-anagram-quest-oracle.hf.space"
 MATCH_TTL_IDLE_SECONDS = 20 * 60
 MATCH_TTL_PLAYING_SECONDS = 45 * 60
 GC_INTERVAL_SECONDS = 60
+ORACLE_CACHE_TTL_SECONDS = 15 * 60
+ORACLE_CACHE_MAX_ENTRIES = 1024
+
+_oracle_client: httpx.AsyncClient | None = None
+_oracle_cache: dict[str, tuple[float, list[str]]] = {}
+_oracle_key_locks: dict[str, asyncio.Lock] = {}
+_oracle_lock_registry_lock = asyncio.Lock()
+
+
+def _oracle_cache_key(letters: list[str]) -> str:
+    return "".join(sorted(letter.upper() for letter in letters))
+
+
+def _trim_oracle_cache() -> None:
+    if len(_oracle_cache) <= ORACLE_CACHE_MAX_ENTRIES:
+        return
+    oldest_key = min(_oracle_cache.items(), key=lambda item: item[1][0])[0]
+    del _oracle_cache[oldest_key]
+
+
+async def _get_oracle_key_lock(key: str) -> asyncio.Lock:
+    async with _oracle_lock_registry_lock:
+        lock = _oracle_key_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _oracle_key_locks[key] = lock
+        return lock
+
+
+async def _get_oracle_client() -> httpx.AsyncClient:
+    global _oracle_client
+    if _oracle_client is None:
+        _oracle_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(12.0, connect=3.0),
+            limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
+        )
+    return _oracle_client
+
+
+async def _close_oracle_client() -> None:
+    global _oracle_client
+    if _oracle_client is not None:
+        await _oracle_client.aclose()
+        _oracle_client = None
 
 
 async def call_oracle(letters: list[str]) -> list[str]:
-    """Call the HF Spaces Oracle to solve an anagram."""
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    """Call the HF Spaces Oracle to solve an anagram with cache + connection pooling."""
+    key = _oracle_cache_key(letters)
+    now = time.time()
+    cached = _oracle_cache.get(key)
+    if cached and now - cached[0] <= ORACLE_CACHE_TTL_SECONDS:
+        return list(cached[1])
+
+    key_lock = await _get_oracle_key_lock(key)
+    async with key_lock:
+        now = time.time()
+        cached = _oracle_cache.get(key)
+        if cached and now - cached[0] <= ORACLE_CACHE_TTL_SECONDS:
+            return list(cached[1])
+
+        client = await _get_oracle_client()
         resp = await client.post(
             f"{ORACLE_URL}/solve",
             json={"letters": letters},
         )
         resp.raise_for_status()
-        return resp.json()["words"]
+        words = [
+            str(word).upper().strip()
+            for word in resp.json().get("words", [])
+            if str(word).strip()
+        ]
+        _oracle_cache[key] = (time.time(), words)
+        _trim_oracle_cache()
+        return list(words)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -532,9 +596,9 @@ async def root() -> dict[str, Any]:
 async def health() -> dict[str, Any]:
     """Health check — also pings the Oracle."""
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(f"{ORACLE_URL}/health")
-            oracle_ok = resp.status_code == 200
+        client = await _get_oracle_client()
+        resp = await client.get(f"{ORACLE_URL}/health", timeout=6.0)
+        oracle_ok = resp.status_code == 200
     except Exception:
         oracle_ok = False
 
@@ -543,6 +607,7 @@ async def health() -> dict[str, Any]:
         "oracle": "ok" if oracle_ok else "unreachable",
         "active_games": len(active_games),
         "active_matches": len(active_matches),
+        "oracle_cache_size": len(_oracle_cache),
     }
 
 
@@ -655,6 +720,7 @@ active_matches: dict[str, MatchState] = {}
 
 class GuessRequest(BaseModel):
     word: str
+    level: int | None = None
 
 
 def _pick_recovery_target(missed_words: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -726,6 +792,18 @@ async def match_guess(match_id: str, req: GuessRequest) -> dict[str, Any]:
 
     level_data = match.levels_data[level - 1]
     word = req.word.upper().strip()
+
+    # Ignore in-flight guesses from a previous level transition.
+    if req.level is not None and req.level != level:
+        return {
+            "valid": False,
+            "reason": "stale_level",
+            "word": word,
+            "reward": 0,
+            "submitted_level": req.level,
+            "active_level": level,
+            "human_bank": match.human_bank,
+        }
 
     # Initialize level tracking if needed
     if level not in match.human_found:
@@ -1238,6 +1316,11 @@ async def start_gc() -> None:
                 del active_matches[match_id]
 
     asyncio.create_task(gc_loop())
+
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    await _close_oracle_client()
 
 
 # ══════════════════════════════════════════════════════════════
