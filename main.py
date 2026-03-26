@@ -608,10 +608,17 @@ class MatchState:
         self.current_level: int = 0
         self.levels_data: list[dict[str, Any]] = []
         self.human_score: float = 0.0
+        self.human_bank: int = 0
         self.human_found: dict[int, list[str]] = {}
         self.human_guesses: dict[int, int] = {}
+        self.human_missed_words: list[dict[str, Any]] = []
+        self.human_bank_log: list[dict[str, Any]] = []
         self.ai_score: float = 0.0
+        self.ai_bank: int = 0
         self.ai_found: dict[int, list[str]] = {}
+        self.ai_missed_words: list[dict[str, Any]] = []
+        self.ai_bank_log: list[dict[str, Any]] = []
+        self.ai_banker = BankingEngine()
         self.ai_guesses: dict[int, list[str]] = {}
         self.ai_guess_cursor: dict[int, int] = {}
         self.ai_completion_awarded: set[int] = set()
@@ -647,6 +654,32 @@ class GuessRequest(BaseModel):
     word: str
 
 
+def _pick_recovery_target(missed_words: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not missed_words:
+        return None
+    return min(missed_words, key=lambda item: len(str(item.get("word", ""))))
+
+
+def _run_recovery(
+    score: float,
+    missed_words: list[dict[str, Any]],
+) -> tuple[bool, float, dict[str, Any] | None, float]:
+    """Run one stochastic recovery attempt using BankingEngine accuracy priors."""
+    target = _pick_recovery_target(missed_words)
+    if not target:
+        return False, score, None, 0.0
+
+    word = str(target["word"])
+    p_success = BankingEngine.ACCURACY.get(len(word), 0.85)
+    if random.random() <= p_success:
+        updated_score = score + 0.5
+        missed_words.remove(target)
+        return True, updated_score, target, p_success
+
+    updated_score = max(0.0, score - 0.1)
+    return False, updated_score, target, p_success
+
+
 @app.post("/match/create")
 async def create_match() -> dict[str, Any]:
     """Create a new Player vs AI match."""
@@ -669,6 +702,8 @@ async def create_match() -> dict[str, Any]:
         "letters": level_data["letters"],
         "word_count": len(level_data["valid_words"]),
         "total_levels": len(match.levels_data),
+        "human_bank": match.human_bank,
+        "ai_bank": match.ai_bank,
     }
 
 
@@ -698,7 +733,13 @@ async def match_guess(match_id: str, req: GuessRequest) -> dict[str, Any]:
 
     # Already found this word?
     if word in match.human_found[level]:
-        return {"valid": False, "reason": "already_found", "word": word, "reward": 0}
+        return {
+            "valid": False,
+            "reason": "already_found",
+            "word": word,
+            "reward": 0,
+            "human_bank": match.human_bank,
+        }
 
     # Is it a valid word for this level?
     if word in level_data["valid_words"]:
@@ -706,6 +747,21 @@ async def match_guess(match_id: str, req: GuessRequest) -> dict[str, Any]:
         reward = 1.0 if is_first_guess else 0.5
         match.human_score += reward
         match.human_found[level].append(word)
+
+        bank_awarded = False
+        bank_event: dict[str, Any] | None = None
+        if level >= 3 and is_first_guess:
+            match.human_bank += 1
+            bank_awarded = True
+            bank_event = {
+                "type": "earn_preserve",
+                "by": "human",
+                "level": level,
+                "delta": 1,
+                "bank_total": match.human_bank,
+                "reason": "first_try_level3_plus",
+            }
+            match.human_bank_log.append(bank_event)
 
         all_found = len(match.human_found[level]) == len(level_data["valid_words"])
         if all_found:
@@ -717,12 +773,106 @@ async def match_guess(match_id: str, req: GuessRequest) -> dict[str, Any]:
             "reward": reward,
             "first_try": is_first_guess,
             "human_score": round(match.human_score, 1),
+            "human_bank": match.human_bank,
             "found_count": len(match.human_found[level]),
             "total_words": len(level_data["valid_words"]),
             "all_found": all_found,
+            "bank_awarded": bank_awarded,
+            "bank_event": bank_event,
         }
     else:
-        return {"valid": False, "reason": "wrong", "word": word, "reward": 0}
+        return {
+            "valid": False,
+            "reason": "wrong",
+            "word": word,
+            "reward": 0,
+            "human_bank": match.human_bank,
+        }
+
+
+@app.post("/match/{match_id}/bank/boost")
+async def match_bank_boost(match_id: str) -> dict[str, Any]:
+    """Spend 1 bank to boost current score (+0.5)."""
+    match = active_matches.get(match_id)
+    if not match:
+        raise HTTPException(404, "Match not found")
+    if match.status != "playing":
+        raise HTTPException(400, "Match not active")
+    if match.current_level < 3:
+        raise HTTPException(400, "Bank actions unlock at level 3")
+    if match.human_bank <= 0:
+        raise HTTPException(400, "No bank available")
+
+    match.touch()
+    match.human_bank -= 1
+    match.human_score += 0.5
+    event = {
+        "type": "spend_current",
+        "by": "human",
+        "level": match.current_level,
+        "delta": -1,
+        "reward": 0.5,
+        "bank_total": match.human_bank,
+    }
+    match.human_bank_log.append(event)
+    return {
+        "ok": True,
+        "action": "boost_current",
+        "reward": 0.5,
+        "human_score": round(match.human_score, 1),
+        "human_bank": match.human_bank,
+        "bank_event": event,
+    }
+
+
+@app.post("/match/{match_id}/bank/recover")
+async def match_bank_recover(match_id: str) -> dict[str, Any]:
+    """Spend 1 bank to attempt recovery of one previously missed word."""
+    match = active_matches.get(match_id)
+    if not match:
+        raise HTTPException(404, "Match not found")
+    if match.status != "playing":
+        raise HTTPException(400, "Match not active")
+    if match.current_level < 3:
+        raise HTTPException(400, "Bank actions unlock at level 3")
+    if match.human_bank <= 0:
+        raise HTTPException(400, "No bank available")
+    if not match.human_missed_words:
+        raise HTTPException(400, "No missed words to recover")
+
+    match.touch()
+    match.human_bank -= 1
+    success, updated_score, target, p_success = _run_recovery(
+        score=match.human_score,
+        missed_words=match.human_missed_words,
+    )
+    match.human_score = updated_score
+
+    event = {
+        "type": "recover",
+        "by": "human",
+        "level": match.current_level,
+        "delta": -1,
+        "success": success,
+        "p_success": round(p_success, 2),
+        "target_word": target["word"] if target else None,
+        "bank_total": match.human_bank,
+        "reward": 0.5 if success else -0.1,
+    }
+    match.human_bank_log.append(event)
+
+    return {
+        "ok": True,
+        "action": "recover",
+        "success": success,
+        "reward": 0.5 if success else -0.1,
+        "p_success": round(p_success, 2),
+        "target_word": target["word"] if target else None,
+        "target_level": target["level"] if target else None,
+        "human_score": round(match.human_score, 1),
+        "human_bank": match.human_bank,
+        "bank_event": event,
+    }
 
 
 @app.post("/match/{match_id}/next-level")
@@ -739,15 +889,36 @@ async def match_next_level(match_id: str) -> dict[str, Any]:
 
     # Record level result
     level_data = match.levels_data[current - 1]
+    valid_words = level_data["valid_words"]
     human_found = match.human_found.get(current, [])
     ai_found = match.ai_found.get(current, [])
+    human_missed = [word for word in valid_words if word not in human_found]
+    ai_missed = [word for word in valid_words if word not in ai_found]
+
+    for word in human_missed:
+        match.human_missed_words.append({
+            "word": word,
+            "level": current,
+            "letters": level_data["sorted_key"],
+        })
+    for word in ai_missed:
+        match.ai_missed_words.append({
+            "word": word,
+            "level": current,
+            "letters": level_data["sorted_key"],
+        })
+
     match.level_results.append({
         "level": current,
         "human_found": human_found,
         "human_count": len(human_found),
+        "human_missed": human_missed,
         "ai_found": ai_found,
         "ai_count": len(ai_found),
-        "total_words": len(level_data["valid_words"]),
+        "ai_missed": ai_missed,
+        "total_words": len(valid_words),
+        "human_bank": match.human_bank,
+        "ai_bank": match.ai_bank,
         "winner": "human" if len(human_found) > len(ai_found) else ("ai" if len(ai_found) > len(human_found) else "tie"),
     })
 
@@ -761,6 +932,10 @@ async def match_next_level(match_id: str) -> dict[str, Any]:
             "level_results": match.level_results,
             "human_score": round(match.human_score, 1),
             "ai_score": round(match.ai_score, 1),
+            "human_bank": match.human_bank,
+            "ai_bank": match.ai_bank,
+            "human_bank_log": match.human_bank_log[-12:],
+            "ai_bank_log": match.ai_bank_log[-12:],
             "winner": "human" if human_wins > ai_wins else ("ai" if ai_wins > human_wins else "tie"),
             "human_levels_won": human_wins,
             "ai_levels_won": ai_wins,
@@ -778,6 +953,10 @@ async def match_next_level(match_id: str) -> dict[str, Any]:
         "level": current + 1,
         "letters": next_data["letters"],
         "word_count": len(next_data["valid_words"]),
+        "human_bank": match.human_bank,
+        "ai_bank": match.ai_bank,
+        "human_bank_log": match.human_bank_log[-8:],
+        "ai_bank_log": match.ai_bank_log[-8:],
         "level_results": match.level_results,
     }
 
@@ -786,7 +965,7 @@ async def match_next_level(match_id: str) -> dict[str, Any]:
 async def match_ai_stream(match_id: str) -> StreamingResponse:
     """
     SSE stream for the AI side of a Player vs AI match.
-    AI solves instantly via Oracle but drip-feeds results every 4-5 seconds.
+    AI solves via Oracle and drip-feeds results on a fast PvAI cadence.
     """
     match = active_matches.get(match_id)
     if not match:
@@ -803,12 +982,48 @@ async def match_ai_stream(match_id: str) -> StreamingResponse:
         level_data = match.levels_data[level - 1]
         letters = level_data["letters"]
         valid_words = level_data["valid_words"]
+        max_guesses = max(2, len(valid_words) * 2)
+
+        # Fast auto-recovery keeps banking strategic without slowing PvAI rounds.
+        if level >= 3 and match.ai_bank > 0 and match.ai_missed_words:
+            should_recover, info = match.ai_banker.decide_recovery(
+                banked=match.ai_bank,
+                failed_words=match.ai_missed_words,
+                levels_remaining=max(0, len(match.levels_data) - level),
+            )
+            if should_recover:
+                match.ai_bank -= 1
+                success, updated_score, target, p_success = _run_recovery(
+                    score=match.ai_score,
+                    missed_words=match.ai_missed_words,
+                )
+                match.ai_score = updated_score
+                event = {
+                    "type": "recover",
+                    "by": "ai",
+                    "level": level,
+                    "delta": -1,
+                    "success": success,
+                    "target_word": target["word"] if target else None,
+                    "bank_total": match.ai_bank,
+                    "reward": 0.5 if success else -0.1,
+                    "ev": round(info["ev"], 3) if info else None,
+                    "p_success": round(p_success, 2),
+                }
+                match.ai_bank_log.append(event)
+                yield sse("ai_thinking", {
+                    "text": (
+                        f"[MDP Bank] Recovery {'success' if success else 'failed'} "
+                        f"for {event['target_word']} ({event['reward']:+.1f})"
+                    ),
+                    "phase": "banking",
+                })
 
         yield sse("ai_thinking", {
             "text": f"[System] Analyzing: {' '.join(letters)}...",
             "phase": "analyze",
         })
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.1)
 
         yield sse("ai_thinking", {
             "text": "[LLM Solver] Extracting valid permutations...",
@@ -817,27 +1032,41 @@ async def match_ai_stream(match_id: str) -> StreamingResponse:
 
         # Cache oracle candidates by level so reconnects resume deterministically.
         if level not in match.ai_guesses:
+            raw_guesses: list[str] = []
             try:
-                raw_guesses = await call_oracle(letters)
-                seen: set[str] = set()
-                normalized: list[str] = []
-                for guess in raw_guesses:
-                    word = str(guess).upper().strip()
-                    if not word or word in seen:
-                        continue
-                    seen.add(word)
-                    normalized.append(word)
-
-                valid_set = set(valid_words)
-                ordered_valid = [word for word in normalized if word in valid_set]
-                ordered_decoys = [
-                    word for word in normalized if word not in valid_set
-                ][: max(1, len(valid_words) // 2)]
-                match.ai_guesses[level] = ordered_valid + ordered_decoys
-                match.ai_guess_cursor[level] = 0
+                raw_guesses = await asyncio.wait_for(call_oracle(letters), timeout=6.0)
+            except asyncio.TimeoutError:
+                yield sse("ai_thinking", {
+                    "text": "[NET] Oracle timeout; switching to local solver cache.",
+                    "phase": "net",
+                })
             except Exception as exc:
-                yield sse("ai_error", {"message": str(exc)})
-                return
+                yield sse("ai_thinking", {
+                    "text": f"[NET] Oracle unavailable ({str(exc)[:70]}). Using local solver cache.",
+                    "phase": "net",
+                })
+
+            seen: set[str] = set()
+            normalized: list[str] = []
+            for guess in raw_guesses:
+                word = str(guess).upper().strip()
+                if not word or word in seen:
+                    continue
+                seen.add(word)
+                normalized.append(word)
+
+            if not normalized:
+                # Fallback prevents PvAI stalls when Oracle is slow/unreachable.
+                normalized = list(valid_words)
+                random.shuffle(normalized)
+
+            valid_set = set(valid_words)
+            ordered_valid = [word for word in normalized if word in valid_set]
+            ordered_decoys = [
+                word for word in normalized if word not in valid_set
+            ][: max(1, len(valid_words) // 2)]
+            match.ai_guesses[level] = ordered_valid + ordered_decoys
+            match.ai_guess_cursor[level] = 0
 
         ai_guesses = match.ai_guesses[level]
 
@@ -845,7 +1074,7 @@ async def match_ai_stream(match_id: str) -> StreamingResponse:
             "text": f"[LLM Solver] Found {len(ai_guesses)} candidates",
             "phase": "result",
         })
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.12)
 
         if level not in match.ai_found:
             match.ai_found[level] = []
@@ -876,6 +1105,46 @@ async def match_ai_stream(match_id: str) -> StreamingResponse:
                 match.ai_score += reward
                 match.ai_found[level].append(word)
 
+                bank_event: dict[str, Any] | None = None
+                if level >= 3 and is_first:
+                    guesses_left = max(0, max_guesses - (idx + 1))
+                    words_remaining = len(valid_words) - len(match.ai_found[level])
+                    decision, info = match.ai_banker.decide_bank_choice(
+                        level=level,
+                        guesses_left=guesses_left,
+                        words_remaining=words_remaining,
+                        _banked=match.ai_bank,
+                    )
+                    if decision == "preserve":
+                        match.ai_bank += 1
+                        bank_event = {
+                            "type": "earn_preserve",
+                            "by": "ai",
+                            "level": level,
+                            "delta": 1,
+                            "bank_total": match.ai_bank,
+                            "ev": info.get("ev_preserve"),
+                        }
+                    else:
+                        match.ai_score += 0.5
+                        bank_event = {
+                            "type": "spend_current",
+                            "by": "ai",
+                            "level": level,
+                            "delta": 0,
+                            "bank_total": match.ai_bank,
+                            "ev": info.get("ev_current"),
+                            "reward": 0.5,
+                        }
+                    match.ai_bank_log.append(bank_event)
+                    yield sse("ai_thinking", {
+                        "text": (
+                            f"[MDP Bank] {'Preserve +1 bank' if decision == 'preserve' else 'Boost current +0.5'} "
+                            f"(EV {bank_event.get('ev', '?')})"
+                        ),
+                        "phase": "banking",
+                    })
+
                 yield sse("ai_guess", {
                     "word": word,
                     "correct": True,
@@ -883,16 +1152,19 @@ async def match_ai_stream(match_id: str) -> StreamingResponse:
                     "reward": reward,
                     "ai_score": round(match.ai_score, 1),
                     "found_count": len(match.ai_found[level]),
+                    "ai_bank": match.ai_bank,
+                    "bank_event": bank_event,
                 })
             else:
                 yield sse("ai_guess", {
                     "word": word,
                     "correct": False,
                     "reward": 0,
+                    "ai_bank": match.ai_bank,
                 })
 
-            # Faster drip-feed in PvAI so rounds feel responsive.
-            await asyncio.sleep(random.uniform(0.6, 1.2))
+            # Fast cadence keeps PvAI competitive without waiting on long delays.
+            await asyncio.sleep(random.uniform(0.2, 0.45))
 
         found_words = match.ai_found[level]
         all_found = len(found_words) == len(valid_words)
@@ -906,6 +1178,8 @@ async def match_ai_stream(match_id: str) -> StreamingResponse:
             "total": len(valid_words),
             "all_found": all_found,
             "ai_score": round(match.ai_score, 1),
+            "ai_bank": match.ai_bank,
+            "ai_bank_log": match.ai_bank_log[-8:],
         })
 
         match.touch()
@@ -928,7 +1202,13 @@ async def match_status(match_id: str) -> dict[str, Any]:
         "status": match.status,
         "current_level": match.current_level,
         "human_score": round(match.human_score, 1),
+        "human_bank": match.human_bank,
+        "human_bank_log": match.human_bank_log[-8:],
+        "human_missed_count": len(match.human_missed_words),
         "ai_score": round(match.ai_score, 1),
+        "ai_bank": match.ai_bank,
+        "ai_bank_log": match.ai_bank_log[-8:],
+        "ai_missed_count": len(match.ai_missed_words),
         "level_results": match.level_results,
     }
 
