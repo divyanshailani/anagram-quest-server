@@ -808,7 +808,7 @@ async def match_ai_stream(match_id: str) -> StreamingResponse:
             "text": f"[System] Analyzing: {' '.join(letters)}...",
             "phase": "analyze",
         })
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.2)
 
         yield sse("ai_thinking", {
             "text": "[LLM Solver] Extracting valid permutations...",
@@ -818,7 +818,22 @@ async def match_ai_stream(match_id: str) -> StreamingResponse:
         # Cache oracle candidates by level so reconnects resume deterministically.
         if level not in match.ai_guesses:
             try:
-                match.ai_guesses[level] = await call_oracle(letters)
+                raw_guesses = await call_oracle(letters)
+                seen: set[str] = set()
+                normalized: list[str] = []
+                for guess in raw_guesses:
+                    word = str(guess).upper().strip()
+                    if not word or word in seen:
+                        continue
+                    seen.add(word)
+                    normalized.append(word)
+
+                valid_set = set(valid_words)
+                ordered_valid = [word for word in normalized if word in valid_set]
+                ordered_decoys = [
+                    word for word in normalized if word not in valid_set
+                ][: max(1, len(valid_words) // 2)]
+                match.ai_guesses[level] = ordered_valid + ordered_decoys
                 match.ai_guess_cursor[level] = 0
             except Exception as exc:
                 yield sse("ai_error", {"message": str(exc)})
@@ -830,15 +845,23 @@ async def match_ai_stream(match_id: str) -> StreamingResponse:
             "text": f"[LLM Solver] Found {len(ai_guesses)} candidates",
             "phase": "result",
         })
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(0.3)
 
         if level not in match.ai_found:
             match.ai_found[level] = []
+
+        if not ai_guesses:
+            yield sse("ai_thinking", {
+                "text": "[LLM Solver] No valid candidates this round.",
+                "phase": "result",
+            })
 
         # Drip-feed scored results; resume from previous cursor on SSE reconnect.
         start_idx = match.ai_guess_cursor.get(level, 0)
         for idx in range(start_idx, len(ai_guesses)):
             if match.status != "playing":
+                break
+            if len(match.ai_found[level]) >= len(valid_words):
                 break
 
             word = ai_guesses[idx]
@@ -868,8 +891,8 @@ async def match_ai_stream(match_id: str) -> StreamingResponse:
                     "reward": 0,
                 })
 
-            # Drip-feed: 3-5 seconds between guesses
-            await asyncio.sleep(random.uniform(3.0, 5.0))
+            # Faster drip-feed in PvAI so rounds feel responsive.
+            await asyncio.sleep(random.uniform(0.6, 1.2))
 
         found_words = match.ai_found[level]
         all_found = len(found_words) == len(valid_words)
