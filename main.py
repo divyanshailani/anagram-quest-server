@@ -11,6 +11,7 @@ FastAPI backend with:
 import uuid
 import random
 import asyncio
+import time
 from typing import AsyncGenerator
 
 import httpx
@@ -512,7 +513,9 @@ async def root():
         "oracle": ORACLE_URL,
         "endpoints": {
             "stream": "GET /stream-ai-play",
-            "status": "GET /game/{game_id}",
+            "match_create": "POST /match/create",
+            "match_guess": "POST /match/{id}/guess",
+            "match_ai": "GET /match/{id}/ai-stream",
             "health": "GET /health",
         },
     }
@@ -532,6 +535,7 @@ async def health():
         "game_master": "ok",
         "oracle": "ok" if oracle_ok else "unreachable",
         "active_games": len(active_games),
+        "active_matches": len(active_matches),
     }
 
 
@@ -585,6 +589,313 @@ async def get_game(game_id: str):
         "bank": game.banked_chances,
         "levels_completed": len(game.level_results),
     }
+
+
+# ══════════════════════════════════════════════════════════════
+# Match Engine — Player vs AI
+# ══════════════════════════════════════════════════════════════
+
+class MatchState:
+    """State for a Player vs AI match."""
+
+    def __init__(self):
+        self.match_id = str(uuid.uuid4())[:8]
+        self.status = "waiting"  # waiting → playing → finished
+        self.current_level = 0
+        self.levels_data = []    # pre-generated: [{sorted_key, letters, valid_words}, ...]
+        self.human_score = 0.0
+        self.human_found = {}    # level -> [words]
+        self.human_guesses = {}  # level -> count
+        self.ai_score = 0.0
+        self.ai_found = {}      # level -> [words]
+        self.level_results = []
+        self.created_at = time.time()
+        self.last_active = time.time()
+
+        # Pre-generate 5 levels of letters
+        for level in range(1, 6):
+            groups = get_level_groups(level)
+            if not groups:
+                continue
+            sorted_key = random.choice(list(groups.keys()))
+            valid_words = groups[sorted_key]
+            letters = list(sorted_key)
+            random.shuffle(letters)
+            self.levels_data.append({
+                "level": level,
+                "sorted_key": sorted_key,
+                "letters": letters,
+                "valid_words": valid_words,
+            })
+
+    def touch(self):
+        self.last_active = time.time()
+
+
+# In-memory match store
+active_matches: dict[str, MatchState] = {}
+
+
+class GuessRequest(BaseModel):
+    word: str
+
+
+@app.post("/match/create")
+async def create_match():
+    """Create a new Player vs AI match."""
+    match = MatchState()
+    match.current_level = 1
+    match.status = "playing"
+    active_matches[match.match_id] = match
+
+    level_data = match.levels_data[0]
+    match.human_found[1] = []
+    match.human_guesses[1] = 0
+    match.ai_found[1] = []
+
+    return {
+        "match_id": match.match_id,
+        "level": 1,
+        "letters": level_data["letters"],
+        "word_count": len(level_data["valid_words"]),
+        "total_levels": len(match.levels_data),
+    }
+
+
+@app.post("/match/{match_id}/guess")
+async def match_guess(match_id: str, req: GuessRequest):
+    """Validate a human player's guess."""
+    match = active_matches.get(match_id)
+    if not match:
+        raise HTTPException(404, "Match not found")
+    if match.status != "playing":
+        raise HTTPException(400, "Match not active")
+
+    match.touch()
+    level = match.current_level
+    level_data = match.levels_data[level - 1]
+    word = req.word.upper().strip()
+
+    # Initialize level tracking if needed
+    if level not in match.human_found:
+        match.human_found[level] = []
+        match.human_guesses[level] = 0
+
+    match.human_guesses[level] = match.human_guesses.get(level, 0) + 1
+
+    # Already found this word?
+    if word in match.human_found[level]:
+        return {"valid": False, "reason": "already_found", "word": word, "reward": 0}
+
+    # Is it a valid word for this level?
+    if word in level_data["valid_words"]:
+        is_first_guess = match.human_guesses[level] == 1 and len(match.human_found[level]) == 0
+        reward = 1.0 if is_first_guess else 0.5
+        match.human_score += reward
+        match.human_found[level].append(word)
+
+        all_found = len(match.human_found[level]) == len(level_data["valid_words"])
+        if all_found:
+            match.human_score += 2.0  # Completion bonus
+
+        return {
+            "valid": True,
+            "word": word,
+            "reward": reward,
+            "first_try": is_first_guess,
+            "human_score": round(match.human_score, 1),
+            "found_count": len(match.human_found[level]),
+            "total_words": len(level_data["valid_words"]),
+            "all_found": all_found,
+        }
+    else:
+        return {"valid": False, "reason": "wrong", "word": word, "reward": 0}
+
+
+@app.post("/match/{match_id}/next-level")
+async def match_next_level(match_id: str):
+    """Advance to the next level."""
+    match = active_matches.get(match_id)
+    if not match:
+        raise HTTPException(404, "Match not found")
+
+    match.touch()
+    current = match.current_level
+
+    # Record level result
+    level_data = match.levels_data[current - 1]
+    human_found = match.human_found.get(current, [])
+    ai_found = match.ai_found.get(current, [])
+    match.level_results.append({
+        "level": current,
+        "human_found": human_found,
+        "human_count": len(human_found),
+        "ai_found": ai_found,
+        "ai_count": len(ai_found),
+        "total_words": len(level_data["valid_words"]),
+        "winner": "human" if len(human_found) > len(ai_found) else ("ai" if len(ai_found) > len(human_found) else "tie"),
+    })
+
+    # Check if game is over
+    if current >= len(match.levels_data):
+        match.status = "finished"
+        human_wins = sum(1 for r in match.level_results if r["winner"] == "human")
+        ai_wins = sum(1 for r in match.level_results if r["winner"] == "ai")
+        return {
+            "game_over": True,
+            "level_results": match.level_results,
+            "human_score": round(match.human_score, 1),
+            "ai_score": round(match.ai_score, 1),
+            "winner": "human" if human_wins > ai_wins else ("ai" if ai_wins > human_wins else "tie"),
+            "human_levels_won": human_wins,
+            "ai_levels_won": ai_wins,
+        }
+
+    # Advance
+    match.current_level = current + 1
+    next_data = match.levels_data[current]  # 0-indexed
+    match.human_found[current + 1] = []
+    match.human_guesses[current + 1] = 0
+    match.ai_found[current + 1] = []
+
+    return {
+        "game_over": False,
+        "level": current + 1,
+        "letters": next_data["letters"],
+        "word_count": len(next_data["valid_words"]),
+        "level_results": match.level_results,
+    }
+
+
+@app.get("/match/{match_id}/ai-stream")
+async def match_ai_stream(match_id: str):
+    """
+    SSE stream for the AI side of a Player vs AI match.
+    AI solves instantly via Oracle but drip-feeds results every 4-5 seconds.
+    """
+    match = active_matches.get(match_id)
+    if not match:
+        raise HTTPException(404, "Match not found")
+
+    import json
+
+    def sse(event_type: str, data: dict) -> str:
+        return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+    async def stream():
+        match.touch()
+        level = match.current_level
+        level_data = match.levels_data[level - 1]
+        letters = level_data["letters"]
+        valid_words = level_data["valid_words"]
+
+        yield sse("ai_thinking", {
+            "text": f"[System] Analyzing: {' '.join(letters)}...",
+            "phase": "analyze",
+        })
+        await asyncio.sleep(1.0)
+
+        yield sse("ai_thinking", {
+            "text": "[LLM Solver] Extracting valid permutations...",
+            "phase": "solve",
+        })
+
+        # Call Oracle instantly
+        try:
+            ai_guesses = await call_oracle(letters)
+        except Exception as e:
+            yield sse("ai_error", {"message": str(e)})
+            return
+
+        yield sse("ai_thinking", {
+            "text": f"[LLM Solver] Found {len(ai_guesses)} candidates",
+            "phase": "result",
+        })
+        await asyncio.sleep(1.5)
+
+        # Drip-feed scored results
+        found = []
+        for i, word in enumerate(ai_guesses):
+            if match.status != "playing":
+                break
+
+            if word in valid_words and word not in found:
+                found.append(word)
+                is_first = len(found) == 1 and i == 0
+                reward = 1.0 if is_first else 0.5
+                match.ai_score += reward
+
+                if level not in match.ai_found:
+                    match.ai_found[level] = []
+                match.ai_found[level].append(word)
+
+                yield sse("ai_guess", {
+                    "word": word,
+                    "correct": True,
+                    "first_try": is_first,
+                    "reward": reward,
+                    "ai_score": round(match.ai_score, 1),
+                    "found_count": len(found),
+                })
+            else:
+                yield sse("ai_guess", {
+                    "word": word,
+                    "correct": False,
+                    "reward": 0,
+                })
+
+            # Drip-feed: 4-5 seconds between guesses
+            await asyncio.sleep(random.uniform(3.5, 5.5))
+
+        # Completion bonus
+        all_found = len(found) == len(valid_words)
+        if all_found:
+            match.ai_score += 2.0
+
+        yield sse("ai_level_done", {
+            "level": level,
+            "found": found,
+            "total": len(valid_words),
+            "all_found": all_found,
+            "ai_score": round(match.ai_score, 1),
+        })
+
+        match.touch()
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
+@app.get("/match/{match_id}/status")
+async def match_status(match_id: str):
+    """Get current match state."""
+    match = active_matches.get(match_id)
+    if not match:
+        raise HTTPException(404, "Match not found")
+    return {
+        "match_id": match.match_id,
+        "status": match.status,
+        "current_level": match.current_level,
+        "human_score": round(match.human_score, 1),
+        "ai_score": round(match.ai_score, 1),
+        "level_results": match.level_results,
+    }
+
+
+# ── Garbage Collection ──
+@app.on_event("startup")
+async def start_gc():
+    async def gc_loop():
+        while True:
+            await asyncio.sleep(60)
+            cutoff = time.time() - 300  # 5 minutes
+            expired = [k for k, v in active_matches.items() if v.last_active < cutoff]
+            for k in expired:
+                del active_matches[k]
+    asyncio.create_task(gc_loop())
 
 
 # ══════════════════════════════════════════════════════════════
