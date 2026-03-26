@@ -28,6 +28,9 @@ from pydantic import BaseModel
 # Oracle Client — Async calls to HF Spaces LLM
 # ══════════════════════════════════════════════════════════════
 ORACLE_URL = "https://ailanidivyansh-anagram-quest-oracle.hf.space"
+MATCH_TTL_IDLE_SECONDS = 20 * 60
+MATCH_TTL_PLAYING_SECONDS = 45 * 60
+GC_INTERVAL_SECONDS = 60
 
 
 async def call_oracle(letters: list[str]) -> list[str]:
@@ -1088,6 +1091,7 @@ async def match_ai_stream(match_id: str) -> StreamingResponse:
         # Drip-feed scored results; resume from previous cursor on SSE reconnect.
         start_idx = match.ai_guess_cursor.get(level, 0)
         for idx in range(start_idx, len(ai_guesses)):
+            match.touch()
             if match.status != "playing":
                 break
             if len(match.ai_found[level]) >= len(valid_words):
@@ -1218,11 +1222,21 @@ async def match_status(match_id: str) -> dict[str, Any]:
 async def start_gc() -> None:
     async def gc_loop() -> None:
         while True:
-            await asyncio.sleep(60)
-            cutoff = time.time() - 300  # 5 minutes
-            expired = [k for k, v in active_matches.items() if v.last_active < cutoff]
-            for k in expired:
-                del active_matches[k]
+            await asyncio.sleep(GC_INTERVAL_SECONDS)
+            now = time.time()
+            expired: list[str] = []
+            for match_id, match in list(active_matches.items()):
+                ttl = (
+                    MATCH_TTL_PLAYING_SECONDS
+                    if match.status == "playing"
+                    else MATCH_TTL_IDLE_SECONDS
+                )
+                if now - match.last_active > ttl:
+                    expired.append(match_id)
+
+            for match_id in expired:
+                del active_matches[match_id]
+
     asyncio.create_task(gc_loop())
 
 
