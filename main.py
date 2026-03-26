@@ -398,6 +398,13 @@ async def ai_play_stream(game: GameState) -> AsyncGenerator[str, None]:
             "total_reward": round(game.total_reward, 1),
         })
 
+        # ── Level Pause: 10s so users can review AI answers ──
+        yield sse("level_pause", {
+            "duration": 10,
+            "level_completed": level,
+        })
+        await asyncio.sleep(10)
+
         # ── Recovery Phase ──
         levels_remaining = 5 - level
         while game.failed_words and game.banked_chances > 0:
