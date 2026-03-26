@@ -36,7 +36,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/anagram-quest
-ExecStart=/opt/anagram-quest/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000 --workers 2
+ExecStart=/opt/anagram-quest/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000 --workers 1 --timeout-keep-alive 75
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
@@ -55,6 +55,38 @@ server {
     listen 80;
     server_name _;
 
+    location = /stream-ai-play {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection '';
+        proxy_set_header X-Accel-Buffering no;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        chunked_transfer_encoding off;
+    }
+
+    location ~ ^/match/.+/ai-stream$ {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection '';
+        proxy_set_header X-Accel-Buffering no;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        chunked_transfer_encoding off;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:8000;
         proxy_http_version 1.1;
@@ -62,13 +94,9 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-
-        # SSE-specific settings
         proxy_set_header Connection '';
-        proxy_buffering off;
-        proxy_cache off;
-        proxy_read_timeout 300s;
-        chunked_transfer_encoding off;
+        proxy_read_timeout 120s;
+        proxy_send_timeout 120s;
     }
 }
 EOF
