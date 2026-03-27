@@ -39,6 +39,54 @@ _oracle_cache: dict[str, tuple[float, list[str]]] = {}
 _oracle_key_locks: dict[str, asyncio.Lock] = {}
 _oracle_lock_registry_lock = asyncio.Lock()
 
+AI_DIFFICULTY_PROFILES: dict[str, dict[str, Any]] = {
+    "easy": {
+        "drip_min_delay": 5.0,
+        "drip_max_delay": 7.0,
+        "drop_ratio": 0.30,
+        "force_preserve": True,
+        "allow_recovery": False,
+    },
+    "medium": {
+        "drip_min_delay": 2.5,
+        "drip_max_delay": 4.0,
+        "drop_ratio": 0.0,
+        "force_preserve": False,
+        "allow_recovery": True,
+    },
+    "hard": {
+        "drip_min_delay": 0.2,
+        "drip_max_delay": 0.45,
+        "drop_ratio": 0.0,
+        "force_preserve": False,
+        "allow_recovery": True,
+    },
+}
+
+
+def _normalize_difficulty(raw_value: str | None) -> str:
+    value = (raw_value or "medium").strip().lower()
+    if value not in AI_DIFFICULTY_PROFILES:
+        raise HTTPException(400, "Invalid difficulty. Use easy, medium, or hard.")
+    return value
+
+
+def _apply_easy_word_drop(valid_words: list[str], drop_ratio: float) -> list[str]:
+    """
+    Reduce candidate coverage in Easy mode so AI intentionally leaves blanks.
+    Keeps at least one valid word and preserves original ordering.
+    """
+    if drop_ratio <= 0 or len(valid_words) <= 1:
+        return list(valid_words)
+
+    drop_count = max(1, int(round(len(valid_words) * drop_ratio)))
+    keep_count = max(1, len(valid_words) - drop_count)
+
+    shuffled = list(valid_words)
+    random.shuffle(shuffled)
+    keep_set = set(shuffled[:keep_count])
+    return [word for word in valid_words if word in keep_set]
+
 
 def _oracle_cache_key(letters: list[str]) -> str:
     return "".join(sorted(letter.upper() for letter in letters))
@@ -670,9 +718,10 @@ async def get_game(game_id: str) -> dict[str, Any]:
 class MatchState:
     """State for a Player vs AI match."""
 
-    def __init__(self) -> None:
+    def __init__(self, difficulty: str = "medium") -> None:
         self.match_id: str = str(uuid.uuid4())[:8]
         self.status: str = "waiting"  # waiting → playing → finished
+        self.difficulty: str = _normalize_difficulty(difficulty)
         self.current_level: int = 0
         self.levels_data: list[dict[str, Any]] = []
         self.human_score: float = 0.0
@@ -723,6 +772,10 @@ class GuessRequest(BaseModel):
     level: int | None = None
 
 
+class MatchCreateRequest(BaseModel):
+    difficulty: str = "medium"
+
+
 def _pick_recovery_target(missed_words: list[dict[str, Any]]) -> dict[str, Any] | None:
     if not missed_words:
         return None
@@ -750,9 +803,10 @@ def _run_recovery(
 
 
 @app.post("/match/create")
-async def create_match() -> dict[str, Any]:
+async def create_match(req: MatchCreateRequest | None = None) -> dict[str, Any]:
     """Create a new Player vs AI match."""
-    match = MatchState()
+    difficulty = _normalize_difficulty(req.difficulty if req else "medium")
+    match = MatchState(difficulty=difficulty)
     if not match.levels_data:
         raise HTTPException(500, "No level data configured")
 
@@ -767,6 +821,7 @@ async def create_match() -> dict[str, Any]:
 
     return {
         "match_id": match.match_id,
+        "difficulty": match.difficulty,
         "level": 1,
         "letters": level_data["letters"],
         "word_count": len(level_data["valid_words"]),
@@ -1064,9 +1119,18 @@ async def match_ai_stream(match_id: str) -> StreamingResponse:
         letters = level_data["letters"]
         valid_words = level_data["valid_words"]
         max_guesses = max(2, len(valid_words) * 2)
+        ai_profile = AI_DIFFICULTY_PROFILES.get(
+            match.difficulty,
+            AI_DIFFICULTY_PROFILES["medium"],
+        )
 
         # Fast auto-recovery keeps banking strategic without slowing PvAI rounds.
-        if level >= 3 and match.ai_bank > 0 and match.ai_missed_words:
+        if (
+            ai_profile["allow_recovery"]
+            and level >= 3
+            and match.ai_bank > 0
+            and match.ai_missed_words
+        ):
             should_recover, info = match.ai_banker.decide_recovery(
                 banked=match.ai_bank,
                 failed_words=match.ai_missed_words,
@@ -1143,6 +1207,11 @@ async def match_ai_stream(match_id: str) -> StreamingResponse:
 
             valid_set = set(valid_words)
             ordered_valid = [word for word in normalized if word in valid_set]
+            if ai_profile["drop_ratio"] > 0:
+                ordered_valid = _apply_easy_word_drop(
+                    ordered_valid,
+                    float(ai_profile["drop_ratio"]),
+                )
             ordered_decoys = [
                 word for word in normalized if word not in valid_set
             ][: max(1, len(valid_words) // 2)]
@@ -1191,12 +1260,19 @@ async def match_ai_stream(match_id: str) -> StreamingResponse:
                 if level >= 3 and is_first:
                     guesses_left = max(0, max_guesses - (idx + 1))
                     words_remaining = len(valid_words) - len(match.ai_found[level])
-                    decision, info = match.ai_banker.decide_bank_choice(
-                        level=level,
-                        guesses_left=guesses_left,
-                        words_remaining=words_remaining,
-                        _banked=match.ai_bank,
-                    )
+                    if ai_profile["force_preserve"]:
+                        decision = "preserve"
+                        info = {
+                            "ev_preserve": "forced_easy",
+                            "reason": "easy_mode_handicap",
+                        }
+                    else:
+                        decision, info = match.ai_banker.decide_bank_choice(
+                            level=level,
+                            guesses_left=guesses_left,
+                            words_remaining=words_remaining,
+                            _banked=match.ai_bank,
+                        )
                     if decision == "preserve":
                         match.ai_bank += 1
                         bank_event = {
@@ -1246,7 +1322,12 @@ async def match_ai_stream(match_id: str) -> StreamingResponse:
                 })
 
             # Fast cadence keeps PvAI competitive without waiting on long delays.
-            await asyncio.sleep(random.uniform(0.2, 0.45))
+            await asyncio.sleep(
+                random.uniform(
+                    float(ai_profile["drip_min_delay"]),
+                    float(ai_profile["drip_max_delay"]),
+                ),
+            )
 
         found_words = match.ai_found[level]
         all_found = len(found_words) == len(valid_words)
@@ -1282,6 +1363,7 @@ async def match_status(match_id: str) -> dict[str, Any]:
     return {
         "match_id": match.match_id,
         "status": match.status,
+        "difficulty": match.difficulty,
         "current_level": match.current_level,
         "human_score": round(match.human_score, 1),
         "human_bank": match.human_bank,
