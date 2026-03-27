@@ -33,6 +33,7 @@ MATCH_TTL_PLAYING_SECONDS = 45 * 60
 GC_INTERVAL_SECONDS = 60
 ORACLE_CACHE_TTL_SECONDS = 15 * 60
 ORACLE_CACHE_MAX_ENTRIES = 1024
+AI_SSE_HEARTBEAT_SECONDS = 10.0
 
 _oracle_client: httpx.AsyncClient | None = None
 _oracle_cache: dict[str, tuple[float, list[str]]] = {}
@@ -1113,6 +1114,35 @@ async def match_ai_stream(match_id: str) -> StreamingResponse:
         return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
     async def stream() -> AsyncGenerator[str, None]:
+        heartbeat_seq = 0
+        last_ping_at = time.monotonic()
+
+        async def maybe_emit_heartbeat() -> str | None:
+            nonlocal heartbeat_seq, last_ping_at
+            now = time.monotonic()
+            if now - last_ping_at < AI_SSE_HEARTBEAT_SECONDS:
+                return None
+            heartbeat_seq += 1
+            last_ping_at = now
+            match.touch()
+            return sse("ai_ping", {
+                "seq": heartbeat_seq,
+                "match_id": match.match_id,
+                "level": match.current_level,
+                "difficulty": match.difficulty,
+                "ts": int(time.time() * 1000),
+            })
+
+        async def sleep_with_heartbeat(seconds: float) -> AsyncGenerator[str, None]:
+            remaining = max(0.0, seconds)
+            while remaining > 0:
+                step = min(remaining, 0.5)
+                await asyncio.sleep(step)
+                remaining -= step
+                ping = await maybe_emit_heartbeat()
+                if ping is not None:
+                    yield ping
+
         match.touch()
         level = match.current_level
         level_data = match.levels_data[level - 1]
@@ -1168,7 +1198,8 @@ async def match_ai_stream(match_id: str) -> StreamingResponse:
             "text": f"[System] Analyzing: {' '.join(letters)}...",
             "phase": "analyze",
         })
-        await asyncio.sleep(0.1)
+        async for hb in sleep_with_heartbeat(0.1):
+            yield hb
 
         yield sse("ai_thinking", {
             "text": "[LLM Solver] Extracting valid permutations...",
@@ -1224,7 +1255,8 @@ async def match_ai_stream(match_id: str) -> StreamingResponse:
             "text": f"[LLM Solver] Found {len(ai_guesses)} candidates",
             "phase": "result",
         })
-        await asyncio.sleep(0.12)
+        async for hb in sleep_with_heartbeat(0.12):
+            yield hb
 
         if level not in match.ai_found:
             match.ai_found[level] = []
@@ -1322,12 +1354,12 @@ async def match_ai_stream(match_id: str) -> StreamingResponse:
                 })
 
             # Fast cadence keeps PvAI competitive without waiting on long delays.
-            await asyncio.sleep(
-                random.uniform(
-                    float(ai_profile["drip_min_delay"]),
-                    float(ai_profile["drip_max_delay"]),
-                ),
+            delay_seconds = random.uniform(
+                float(ai_profile["drip_min_delay"]),
+                float(ai_profile["drip_max_delay"]),
             )
+            async for hb in sleep_with_heartbeat(delay_seconds):
+                yield hb
 
         found_words = match.ai_found[level]
         all_found = len(found_words) == len(valid_words)
